@@ -1,0 +1,9 @@
+.chrome-profile/
+config.json
+credentials.json
+.venv/
+.vscode/
+.idea/
+__pycache__/
+*.py[cod]
+.DS_Store
