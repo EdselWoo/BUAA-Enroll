@@ -82,6 +82,8 @@ class EnrollmentTests(unittest.TestCase):
         self.assertTrue(enroll.choose_target_once(driver, self.target, 1))
         search.assert_called_with(driver, "TEST001", "002")
         button.click.assert_called_once()
+        enroll.wait_for_result.assert_called_once_with(driver, 1)
+        enroll.confirm_normal_selection.assert_not_called()
 
     def test_success_without_selected_state_pauses(self):
         driver, row, button, search = self.prepare_selection()
@@ -92,7 +94,7 @@ class EnrollmentTests(unittest.TestCase):
     def test_timeout_after_click_does_not_try_another_course(self):
         driver, row, button, search = self.prepare_selection()
         search.return_value = [row, Mock()]
-        enroll.confirm_normal_selection.side_effect = enroll.TimeoutException()
+        enroll.wait_for_result.side_effect = enroll.TimeoutException()
         with self.assertRaises(enroll.ManualActionRequired):
             enroll.choose_target_once(driver, self.target, 1)
         button.click.assert_called_once()
@@ -103,6 +105,34 @@ class EnrollmentTests(unittest.TestCase):
         button.is_enabled.return_value = False
         self.assertFalse(enroll.choose_target_once(driver, self.target, 1))
         button.click.assert_not_called()
+
+    def test_known_floating_tool_is_removed_before_retry(self):
+        driver, button, blocker = Mock(), Mock(), Mock()
+        driver.execute_script.side_effect = [None, blocker, None]
+        button.click.side_effect = [enroll.ElementClickInterceptedException(), None]
+        enroll.click_choose_button(driver, button)
+        self.assertEqual(button.click.call_count, 2)
+        self.assertEqual(driver.execute_script.call_args.args[1:], (blocker,))
+        self.assertIn("arguments[0].remove()", driver.execute_script.call_args.args[0])
+
+    def test_unknown_overlay_is_not_bypassed(self):
+        driver, button = Mock(), Mock()
+        driver.execute_script.side_effect = [None, None]
+        button.click.side_effect = enroll.ElementClickInterceptedException()
+        with self.assertRaises(enroll.ManualActionRequired):
+            enroll.click_choose_button(driver, button)
+        button.click.assert_called_once()
+
+    def test_repeated_interception_after_toolbar_removal_pauses(self):
+        driver, row, button, search = self.prepare_selection()
+        blocker = Mock()
+        driver.execute_script.side_effect = [None, blocker, None]
+        button.click.side_effect = enroll.ElementClickInterceptedException()
+        with self.assertRaises(enroll.ManualActionRequired):
+            enroll.choose_target_once(driver, self.target, 1)
+        self.assertEqual(button.click.call_count, 2)
+        self.assertEqual(driver.execute_script.call_args.args[1:], (blocker,))
+        enroll.confirm_normal_selection.assert_not_called()
 
     def test_invalid_settings_are_rejected(self):
         read = self.mock("read_json")

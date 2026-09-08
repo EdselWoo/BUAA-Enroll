@@ -8,7 +8,11 @@ import time
 from pathlib import Path
 
 from selenium import webdriver
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
@@ -463,6 +467,31 @@ def wait_for_result(driver, result_timeout):
     raise ManualActionRequired(f"{reason}；请核对选课结果，避免继续提交同类候选课程")
 
 
+def click_choose_button(driver, button):
+    """用原生点击选择；已知悬浮折叠工具遮挡时将其从当前页面移除。"""
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});",
+        button,
+    )
+    try:
+        button.click()
+        return
+    except ElementClickInterceptedException:
+        blocker = driver.execute_script("""
+            const r = arguments[0].getBoundingClientRect();
+            const x = (Math.max(0, r.left) + Math.min(innerWidth, r.right)) / 2;
+            const y = (Math.max(0, r.top) + Math.min(innerHeight, r.bottom)) / 2;
+            const hit = document.elementFromPoint(x, y);
+            return hit && hit.closest('.centre-btn[draggable="true"]');
+        """, button)
+        if blocker is None:
+            raise ManualActionRequired("选择按钮被其他页面元素遮挡，请在 Chrome 中检查")
+
+    driver.execute_script("arguments[0].remove();", blocker)
+    print("选择按钮被悬浮折叠工具遮挡，已移除该工具并重新点击。")
+    button.click()
+
+
 def choose_target_once(driver, target, result_timeout):
     course_code = target["course_code"]
     serial_code = target["serial_code"]
@@ -516,12 +545,7 @@ def choose_target_once(driver, target, result_timeout):
             return False
 
         try:
-            choose_buttons[0].click()
-            WebDriverWait(driver, 10).until(
-                lambda d: visible_elements(d, By.CSS_SELECTOR, ".el-message-box__wrapper")
-                or visible_elements(d, By.CSS_SELECTOR, ".el-dialog__wrapper")
-            )
-            confirm_normal_selection(driver)
+            click_choose_button(driver, choose_buttons[0])
             if not wait_for_result(driver, result_timeout):
                 return False
 
@@ -534,7 +558,7 @@ def choose_target_once(driver, target, result_timeout):
                 if selected_capacity and selected_capacity["selected_by_me"]:
                     return True
             raise ManualActionRequired(f"{row_label} 收到成功提示，但未查到已选状态，请核对结果")
-        except (TimeoutException, StaleElementReferenceException) as error:
+        except (ElementClickInterceptedException, TimeoutException, StaleElementReferenceException) as error:
             raise ManualActionRequired(
                 f"{row_label} 选择后的页面状态未能确认，请核对选课结果"
             ) from error
