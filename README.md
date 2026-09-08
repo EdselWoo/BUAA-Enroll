@@ -106,8 +106,12 @@ Selenium 会自动管理与 Chrome 匹配的驱动，通常无需手动下载 Ch
 | `retry_interval` | `2` | 相邻候选课程之间的等待秒数 |
 | `page_reload_every` | `10` | 每多少轮完整刷新页面；`0` 表示不自动完整刷新 |
 | `login_reminder_interval` | `300` | 等待登录时的提示间隔（秒） |
-| `result_timeout` | `30` | 提交后等待最终结果的时间（秒） |
+| `result_timeout` | `30` | 提交后等待明确结果的时间（秒）；超时会暂停并要求手动核对 |
 | `keep_browser_open` | `false` | 程序结束后是否等待确认再关闭 Chrome |
+
+时间参数必须是有限数值；`retry_interval` 可为 `0`，其他时间参数必须大于 `0`。`page_reload_every` 必须是非负整数。即使关闭定期刷新，离开选课页面后也会重新检查登录和轮次。
+
+收到成功提示后，程序会重新查询对应教学班，仅在确认已选后完成该类别。排队超时、结果未知或选择后的页面状态无法确认时，会暂停自动处理，等待你在 Chrome 中核对结果后按回车退出。重新运行前，请确认上一笔请求已结束。
 
 ## 凭据安全
 
@@ -129,6 +133,14 @@ python buaa_enroll.py [--config PATH] [--credentials PATH] [--profile-dir PATH]
 - 课程余量和最终选课结果以学校系统显示为准。
 - 请使用合理的查询间隔，避免对服务器造成不必要的负载。
 
+## 本地验证
+
+本地回归测试使用 Python 标准库 `unittest`，无需真实登录或提交选课：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## 项目结构
 
 ```text
@@ -139,6 +151,7 @@ python buaa_enroll.py [--config PATH] [--credentials PATH] [--profile-dir PATH]
 ├── Sample/
 │   └── Sample.jpeg      # 选课成功截图
 ├── requirements.txt         # Python 依赖
+├── tests/                   # 不连接选课网站的回归测试
 └── LICENSE                  # MIT 许可证
 ```
 

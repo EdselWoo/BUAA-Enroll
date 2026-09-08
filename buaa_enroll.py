@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -9,6 +10,7 @@ from pathlib import Path
 from selenium import webdriver
 from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 
@@ -111,11 +113,14 @@ def load_credentials(credentials_file):
     data = read_json(credentials_file, "credentials.json")
     if not isinstance(data, dict):
         raise ValueError("credentials.json 的顶层必须是 JSON 对象")
-    username = str(data.get("username", "")).strip()
-    password = str(data.get("password", ""))
-    if not username or not password:
-        raise ValueError("credentials.json 中的 username 和 password 不能为空")
-    return username, password
+    username = data.get("username")
+    password = data.get("password")
+    if (
+        not isinstance(username, str) or not username.strip()
+        or not isinstance(password, str) or not password
+    ):
+        raise ValueError("credentials.json 中的 username 和 password 必须是非空字符串")
+    return username.strip(), password
 
 
 def try_sso_login(driver, username, password):
@@ -173,7 +178,7 @@ def confirm_available_batch(driver):
             raise RuntimeError("选择轮次窗口中未找到确定按钮")
 
         confirm_buttons[0].click()
-        WebDriverWait(driver, 20).until(lambda d: not dialog.is_displayed())
+        WebDriverWait(driver, 20).until(EC.invisibility_of_element(dialog))
         print("已确认网站自动选中的可用轮次。")
         return True
 
@@ -188,10 +193,14 @@ def wait_until_ready(driver, username, password, login_reminder_interval):
         print("首页加载超时，将在当前页面继续等待。")
     print("正在使用 credentials.json 完成统一身份认证。")
 
-    next_reminder = time.time() + login_reminder_interval
+    next_reminder = time.monotonic() + login_reminder_interval
     clicked = False
     login_attempted = False
     while True:
+        if visible_elements(
+            driver, By.XPATH, "//*[contains(text(), '学生无权限访问该轮次数据')]"
+        ):
+            raise ManualActionRequired("当前轮次无访问权限，请确认选课轮次和登录状态")
         if "/elective/grablessons" in driver.current_url:
             WebDriverWait(driver, 30).until(
                 lambda d: visible_elements(
@@ -213,9 +222,9 @@ def wait_until_ready(driver, username, password, login_reminder_interval):
         if "sso.buaa.edu.cn/login" in driver.current_url and not login_attempted:
             login_attempted = try_sso_login(driver, username, password)
 
-        if time.time() >= next_reminder:
+        if time.monotonic() >= next_reminder:
             print("仍在等待登录或进入选课页面，可按 Ctrl+C 停止脚本。")
-            next_reminder = time.time() + login_reminder_interval
+            next_reminder = time.monotonic() + login_reminder_interval
 
         time.sleep(1)
 
@@ -323,7 +332,7 @@ def search_courses(driver, course_code, serial_code):
         if len(cells) < 2:
             continue
 
-        row_code = cells[0].text.strip().splitlines()[0]
+        row_code = cells[0].text.strip().partition("\n")[0]
         row_serial = cells[1].text.strip().zfill(3)
         if row_code == course_code and (
             serial_code is None or row_serial == serial_code
@@ -335,7 +344,7 @@ def search_courses(driver, course_code, serial_code):
 
 def course_identity(row):
     cells = row.find_elements(By.TAG_NAME, "td")
-    return cells[0].text.strip().splitlines()[0], cells[1].text.strip().zfill(3)
+    return cells[0].text.strip().partition("\n")[0], cells[1].text.strip().zfill(3)
 
 
 def capacity_status(driver, row, menu_name):
@@ -409,12 +418,12 @@ def confirm_normal_selection(driver):
 
 
 def wait_for_result(driver, result_timeout):
-    """监听网站提示；返回 True 表示成功，False 表示本次未成功。"""
-    deadline = time.time() + result_timeout
+    """监听明确结果；成功提示仍需核验课程状态，结果未知时暂停。"""
+    deadline = time.monotonic() + result_timeout
     seen = set()
     queued = False
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         # 服务器可能返回冲突等二次确认，不自动越过这类限制。
         boxes = visible_elements(driver, By.CSS_SELECTOR, ".el-message-box__wrapper")
         if boxes:
@@ -440,18 +449,18 @@ def wait_for_result(driver, result_timeout):
             print(f"网站提示：{message}")
             if "进入选课队列" in message:
                 queued = True
-            elif "成功" in message:
+            elif re.fullmatch(r"(?:选课|选择课程|操作)成功[！!。]?", message):
                 return True
-            else:
+            elif any(word in message for word in ("失败", "未成功", "不成功", "已满", "冲突")):
                 return False
 
         time.sleep(0.2)
 
     if queued:
-        print("已进入队列，但未在限定时间内收到最终结果，将重新查询课程状态。")
+        reason = "已进入队列，但未在限定时间内收到最终结果"
     else:
-        print("未收到网站结果，将重新查询。")
-    return False
+        reason = "未在限定时间内收到明确的选课结果"
+    raise ManualActionRequired(f"{reason}；请核对选课结果，避免继续提交同类候选课程")
 
 
 def choose_target_once(driver, target, result_timeout):
@@ -493,24 +502,42 @@ def choose_target_once(driver, target, result_timeout):
             choose_buttons = [
                 button
                 for button in row.find_elements(By.TAG_NAME, "button")
-                if button.is_displayed() and button.text.strip() == "选择"
+                if button.is_displayed()
+                and button.is_enabled()
+                and button.text.strip() == "选择"
             ]
             if not choose_buttons:
                 print(f"课程当前不可选择，操作栏显示：{state or '无按钮'}")
                 continue
 
             print(f"{row_label} 有剩余容量，正在提交选择请求……")
-            choose_buttons[0].click()
         except StaleElementReferenceException:
             print("课程列表刚刚刷新，将重新查询。")
             return False
 
-        WebDriverWait(driver, 10).until(
-            lambda d: visible_elements(d, By.CSS_SELECTOR, ".el-message-box__wrapper")
-            or visible_elements(d, By.CSS_SELECTOR, ".el-dialog__wrapper")
-        )
-        confirm_normal_selection(driver)
-        return wait_for_result(driver, result_timeout)
+        try:
+            choose_buttons[0].click()
+            WebDriverWait(driver, 10).until(
+                lambda d: visible_elements(d, By.CSS_SELECTOR, ".el-message-box__wrapper")
+                or visible_elements(d, By.CSS_SELECTOR, ".el-dialog__wrapper")
+            )
+            confirm_normal_selection(driver)
+            if not wait_for_result(driver, result_timeout):
+                return False
+
+            # 提示可能来自其他请求，只有目标教学班的已选状态能确认完成。
+            for selected_row in search_courses(driver, row_code, row_serial):
+                selected_state = operation_text(selected_row)
+                if "退选" in selected_state or "已选" in selected_state:
+                    return True
+                selected_capacity = capacity_status(driver, selected_row, target["menu_name"])
+                if selected_capacity and selected_capacity["selected_by_me"]:
+                    return True
+            raise ManualActionRequired(f"{row_label} 收到成功提示，但未查到已选状态，请核对结果")
+        except (TimeoutException, StaleElementReferenceException) as error:
+            raise ManualActionRequired(
+                f"{row_label} 选择后的页面状态未能确认，请核对选课结果"
+            ) from error
 
     print(f"{target_label} 当前没有多余容量。")
     return False
@@ -525,19 +552,19 @@ def validate_courses(courses):
         if not isinstance(course, dict):
             raise ValueError(f"courses 第 {index} 项必须是 JSON 对象")
         course_type = str(course.get("type", "")).strip()
-        course_code = str(course.get("code", "")).strip()
+        course_code = course.get("code")
         serial_value = course.get("serial")
         serial_code = str(serial_value).strip() if serial_value is not None else None
         course_name = str(course.get("name", "")).strip()
         if course_type not in COURSE_TYPE_TO_MENU:
             choices = "、".join(COURSE_TYPE_TO_MENU)
             raise ValueError(f"不支持的课程类型：{course_type}；可选值：{choices}")
-        if not course_code:
-            raise ValueError("目标课程代码不能为空")
+        if not isinstance(course_code, str) or not course_code.strip():
+            raise ValueError("目标课程代码必须是非空字符串")
         targets.append(
             {
                 "menu_name": COURSE_TYPE_TO_MENU[course_type],
-                "course_code": course_code.upper(),
+                "course_code": course_code.strip().upper(),
                 "serial_code": serial_code.zfill(3) if serial_code else None,
                 "course_name": course_name,
             }
@@ -556,9 +583,17 @@ def load_config(config_file):
         raise ValueError("settings 必须是 JSON 对象")
     settings = DEFAULT_SETTINGS | custom_settings
 
+    numeric_settings = (
+        "retry_interval", "page_reload_every", "login_reminder_interval", "result_timeout"
+    )
     try:
+        for key in numeric_settings:
+            if isinstance(settings[key], bool) or not math.isfinite(float(settings[key])):
+                raise ValueError(f"{key} 必须是有限数值")
+        if not float(settings["page_reload_every"]).is_integer():
+            raise ValueError("page_reload_every 必须是整数")
         settings["retry_interval"] = float(settings["retry_interval"])
-        settings["page_reload_every"] = int(settings["page_reload_every"])
+        settings["page_reload_every"] = int(float(settings["page_reload_every"]))
         settings["login_reminder_interval"] = float(
             settings["login_reminder_interval"]
         )
@@ -619,6 +654,13 @@ def main():
                 ):
                     continue
 
+                if "/elective/grablessons" not in driver.current_url:
+                    print("已离开选课页面，重新检查登录和当前轮次。")
+                    wait_until_ready(
+                        driver, username, password, settings["login_reminder_interval"]
+                    )
+                    current_menu = None
+
                 if target["menu_name"] != current_menu:
                     try:
                         select_menu(driver, target["menu_name"])
@@ -642,8 +684,8 @@ def main():
                     success = choose_target_once(
                         driver, target, settings["result_timeout"]
                     )
-                except TimeoutException:
-                    print("页面响应超时，本次跳过并继续运行。")
+                except (TimeoutException, StaleElementReferenceException):
+                    print("查询超时或课程列表刚刚刷新，本次跳过并继续运行。")
                     success = False
 
                 if success:
